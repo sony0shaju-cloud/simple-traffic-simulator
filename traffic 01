@@ -1,0 +1,176 @@
+import mesa
+import time
+from IPython.display import clear_output
+
+# --- 1. CONFIGURATION ---
+GRID_SIZE = 11  # 11x11 Grid
+INTERSECTION = (5, 5) # The middle point
+
+# --- 2. THE AGENTS ---
+
+class TrafficSignal(mesa.Agent):
+    def __init__(self, model):
+        # Mesa 3.0: Auto-generates unique_id if not provided, but we can stick to explicit
+        super().__init__(model) 
+        self.state = "Horizontal_Green" # Modes: Horizontal_Green OR Vertical_Green
+        self.timer = 0
+
+    def step(self):
+        self.timer += 1
+        # Switch lights every 5 ticks
+        if self.timer >= 5:
+            self.timer = 0
+            if self.state == "Horizontal_Green":
+                self.state = "Vertical_Green"
+            else:
+                self.state = "Horizontal_Green"
+
+class ColoredCar(mesa.Agent):
+    def __init__(self, model, color, direction, name):
+        super().__init__(model)
+        self.color = color
+        self.direction = direction # "Right" or "Up"
+        self.name = name
+        self.wait_time = 0
+        self.finished = False
+        self.score = 0
+
+    def step(self):
+        if self.finished:
+            return
+
+        x, y = self.pos
+        
+        # 1. Calculate Next Move
+        if self.direction == "Right":
+            next_pos = (x + 1, y)
+        else: # Up
+            next_pos = (x, y + 1)
+
+        # 2. Check Destination
+        if next_pos[0] >= GRID_SIZE or next_pos[1] >= GRID_SIZE:
+            self.finish_race()
+            return
+
+        # 3. Traffic Logic
+        should_stop = False
+        
+        # Look for the Signal
+        light_agent = None
+        # Mesa 3.0: get_cell_list_contents works the same
+        cell_contents = self.model.grid.get_cell_list_contents([INTERSECTION])
+        for obj in cell_contents:
+            if isinstance(obj, TrafficSignal):
+                light_agent = obj
+
+        entering_intersection = (next_pos == INTERSECTION)
+
+        if entering_intersection and light_agent:
+            if self.direction == "Right" and light_agent.state == "Vertical_Green":
+                should_stop = True
+            elif self.direction == "Up" and light_agent.state == "Horizontal_Green":
+                should_stop = True
+
+        # Look for Cars ahead
+        next_cell_contents = self.model.grid.get_cell_list_contents([next_pos])
+        for obj in next_cell_contents:
+            if isinstance(obj, ColoredCar):
+                should_stop = True
+
+        # 4. Move or Wait
+        if should_stop:
+            self.wait_time += 1
+        else:
+            self.model.grid.move_agent(self, next_pos)
+
+    def finish_race(self):
+        self.finished = True
+        self.model.grid.remove_agent(self)
+        self.model.agents.remove(self) # Remove from scheduler equivalent
+        # Rating: Start with 10, subtract wait time
+        self.score = max(1, 10 - self.wait_time)
+        self.model.finished_cars.append(self)
+
+# --- 3. THE MODEL (UPDATED FOR MESA 3.0) ---
+
+class XRoadModel(mesa.Model):
+    def __init__(self):
+        super().__init__() # Initialize parent
+        self.grid = mesa.space.MultiGrid(GRID_SIZE, GRID_SIZE, torus=False)
+        self.step_count = 0
+        self.finished_cars = []
+
+        # Place Traffic Light in Center
+        self.signal = TrafficSignal(self)
+        self.grid.place_agent(self.signal, INTERSECTION)
+        # Mesa 3.0: Add to self.agents manually if not using auto-add (safest way)
+        self.agents.add(self.signal)
+
+    def step(self):
+        self.step_count += 1
+        
+        # --- STAGGERED SPAWNING (Manually Adding Agents) ---
+        
+        # Car 1 (Red) - Starts T=1
+        if self.step_count == 1:
+            c1 = ColoredCar(self, "🔴", "Right", "Red Racer")
+            self.grid.place_agent(c1, (0, 5))
+            self.agents.add(c1)
+
+        # Car 2 (Blue) - Starts T=3
+        if self.step_count == 3:
+            c2 = ColoredCar(self, "🔵", "Up", "Blue Bolt")
+            self.grid.place_agent(c2, (5, 0))
+            self.agents.add(c2)
+
+        # Car 3 (Yellow) - Starts T=6
+        if self.step_count == 6:
+            c3 = ColoredCar(self, "🟡", "Right", "Yellow Yacht")
+            self.grid.place_agent(c3, (0, 5))
+            self.agents.add(c3)
+
+        # Car 4 (Green) - Starts T=8
+        if self.step_count == 8:
+            c4 = ColoredCar(self, "🟢", "Up", "Green Giant")
+            self.grid.place_agent(c4, (5, 0))
+            self.agents.add(c4)
+
+        # Mesa 3.0: "shuffle_do" replaces the old random scheduler
+        self.agents.shuffle_do("step")
+
+    def print_visuals(self):
+        output = ""
+        light_symbol = "🛑" if self.signal.state == "Vertical_Green" else "🚥"
+        
+        for y in range(GRID_SIZE-1, -1, -1):
+            row = ""
+            for x in range(GRID_SIZE):
+                cell = self.grid.get_cell_list_contents([(x,y)])
+                char = " . "
+                if x == 5 or y == 5: char = " ⬜ " # Road
+                
+                for obj in cell:
+                    if isinstance(obj, TrafficSignal): char = f" {light_symbol} "
+                    if isinstance(obj, ColoredCar): char = f" {obj.color} "
+                row += char
+            output += row + "\n"
+        
+        print(f"TIME: {self.step_count} | Signal: {self.signal.state}")
+        print(output)
+        
+        if self.finished_cars:
+            print("--- 🏁 SCOREBOARD ---")
+            for car in self.finished_cars:
+                print(f"{car.color} {car.name}: {car.score}/10")
+
+# --- 4. RUN IT ---
+model = XRoadModel()
+
+print("Starting Sim...")
+time.sleep(1)
+
+for i in range(35):
+    model.step()
+    clear_output(wait=True)
+    model.print_visuals()
+    time.sleep(0.4)
