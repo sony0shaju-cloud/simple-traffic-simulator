@@ -1,211 +1,293 @@
-!pip install mesa tabulate
+# 1. INSTALL LIBRARIES
+!pip install -q mesa matplotlib
 
 import mesa
-import time
 import random
-from IPython.display import clear_output
-from tabulate import tabulate # For the fancy scoreboard
+import time
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from IPython.display import display, clear_output
 
 # --- 1. CONFIGURATION ---
-GRID_SIZE = 15       # Bigger map for trees
-CENTER = 7           # Middle lane
-INTERSECTION = (CENTER, CENTER)
+GRID_SIZE = 30
 
-# --- 2. AGENTS ---
+# ROAD COORDINATES
+H_LANE_1, H_LANE_2 = 14, 15
+V1_LANE_1, V1_LANE_2 = 8, 9
+V2_LANE_1, V2_LANE_2 = 20, 21
+F1_LANE_1, F1_LANE_2 = 6, 7
+F2_LANE_1, F2_LANE_2 = 23, 24
+
+# --- 2. ASSETS ---
 
 class Tree(mesa.Agent):
-    """A decorative tree to make it look like the image."""
+    def __init__(self, model):
+        super().__init__(model)
+
+class Pothole(mesa.Agent):
     def __init__(self, model):
         super().__init__(model)
 
 class SignalPole(mesa.Agent):
-    """A Signal Pole that sits on the sidewalk (GRASS), not the road."""
-    def __init__(self, model, direction_controlled):
+    def __init__(self, model, group_id):
         super().__init__(model)
-        self.direction = direction_controlled # "Horizontal" or "Vertical"
-        self.color = "🔴" # Default Red
+        self.group_id = group_id
+        self.state = "Red"
 
-class Car(mesa.Agent):
-    def __init__(self, model, icon, name, direction, start_pos):
+class SmartVehicle(mesa.Agent):
+    def __init__(self, model, v_type, direction, start_pos):
         super().__init__(model)
-        self.icon = icon
-        self.name = name
+        self.v_type = v_type
+        self.start_direction = direction
         self.direction = direction
-        self.wait_time = 0
-        self.rating = 10.0
+        self.start_time = model.current_time_min
         self.finished = False
-        
-        # Determine movement delta
-        if direction == "Right": self.dx, self.dy = (1, 0)
-        elif direction == "Up":  self.dx, self.dy = (0, 1)
+        self.wait_time = 0
+        self.slow_counter = 0
+
+        self.icon = "🚗"
+        if v_type == "Bus": self.icon = "🚌"
+        elif v_type == "Bike": self.icon = "🏍️"
+        elif v_type == "Truck": self.icon = "🚛"
+        elif v_type == "Auto": self.icon = "🛺"
+
+        self.intent = random.choices(["Straight", "Turn Left", "Turn Right"], weights=[0.5, 0.25, 0.25])[0]
+        self.dx, self.dy = 0, 0
+        self.arrow = ''
+        self.update_vectors(direction)
+
+    def update_vectors(self, direction):
+        self.direction = direction
+        self.dx, self.dy = 0, 0
+        if direction == "Right": self.dx = 1; self.arrow = '>'
+        elif direction == "Left": self.dx = -1; self.arrow = '<'
+        elif direction == "Up":   self.dy = 1; self.arrow = '^'
+        elif direction == "Down": self.dy = -1; self.arrow = 'v'
 
     def step(self):
         if self.finished: return
 
+        # Pothole Physics
+        if self.slow_counter > 0:
+            self.slow_counter -= 1
+            return
+
         x, y = self.pos
+        if any(isinstance(o, Pothole) for o in self.model.grid.get_cell_list_contents([(x,y)])):
+            if random.random() < 0.4:
+                self.slow_counter = 2
+                return
+
+        # Navigation
+        on_V = (x in [V1_LANE_1, V1_LANE_2, V2_LANE_1, V2_LANE_2])
+        on_H = (y in [H_LANE_1, H_LANE_2, F1_LANE_1, F1_LANE_2, F2_LANE_1, F2_LANE_2])
+
+        if on_V and on_H and self.intent != "Straight":
+            if x in [V1_LANE_2, V2_LANE_2]:
+                if self.direction not in ["Up", "Down"]: self.update_vectors("Up")
+            if x in [V1_LANE_1, V2_LANE_1]:
+                if self.direction not in ["Up", "Down"]: self.update_vectors("Down")
+            if y in [H_LANE_1, F1_LANE_1, F2_LANE_1]:
+                if self.direction not in ["Left", "Right"]: self.update_vectors("Left")
+            if y in [H_LANE_2, F1_LANE_2, F2_LANE_2]:
+                if self.direction not in ["Left", "Right"]: self.update_vectors("Right")
+
         next_pos = (x + self.dx, y + self.dy)
 
-        # 1. Check Destination (Despawn)
+        # Despawn
         if not (0 <= next_pos[0] < GRID_SIZE and 0 <= next_pos[1] < GRID_SIZE):
             self.finished = True
             self.model.grid.remove_agent(self)
             self.model.agents.remove(self)
-            self.model.completed_cars.append(self)
+            self.model.trip_times.append(self.model.current_time_min - self.start_time)
             return
 
-        # 2. Logic: Should I stop?
         should_stop = False
-        
-        # A. Check Traffic Lights
-        # We look at the Model's global signal state
-        # If I am entering the intersection...
-        dist_to_center = abs(x - CENTER) + abs(y - CENTER)
-        
-        # If I am 1 step away from the Intersection box
-        is_at_stop_line = False
-        if self.direction == "Right" and x == CENTER - 1: is_at_stop_line = True
-        if self.direction == "Up"    and y == CENTER - 1: is_at_stop_line = True
-        
-        if is_at_stop_line:
-            # Check the global signal state
-            if self.direction == "Right" and self.model.signal_state == "Vertical_Green":
-                should_stop = True
-            if self.direction == "Up" and self.model.signal_state == "Horizontal_Green":
-                should_stop = True
 
-        # B. Check Car Ahead (Collision Prevention)
+        # Signal Logic
+        near_H_road = (abs(y - H_LANE_1) < 3) or (abs(y - F1_LANE_1) < 3) or (abs(y - F2_LANE_1) < 3)
+        near_V_road = (abs(x - V1_LANE_1) < 3) or (abs(x - V2_LANE_1) < 3)
+
+        if near_H_road and near_V_road:
+            signal_color = "Green"
+            if self.direction in ["Up", "Down"]: signal_color = self.model.vertical_state
+            elif self.direction in ["Left", "Right"]: signal_color = self.model.horizontal_state
+
+            next_in_V = (V1_LANE_1 <= next_pos[0] <= V1_LANE_2) or (V2_LANE_1 <= next_pos[0] <= V2_LANE_2)
+            next_in_H = (H_LANE_1 <= next_pos[1] <= H_LANE_2) or (F1_LANE_1 <= next_pos[1] <= F1_LANE_2) or (F2_LANE_1 <= next_pos[1] <= F2_LANE_2)
+            current_in_box = on_V and on_H
+
+            if (next_in_V and next_in_H) and not current_in_box:
+                if signal_color != "Green": should_stop = True
+
+        # Collision Check
         cell_ahead = self.model.grid.get_cell_list_contents([next_pos])
         for obj in cell_ahead:
-            if isinstance(obj, Car): should_stop = True
+            if isinstance(obj, SmartVehicle): should_stop = True
 
-        # 3. Execute
         if should_stop:
             self.wait_time += 1
-            # Decrease rating (Max 10, Min 1)
-            self.rating = max(1.0, 10.0 - (self.wait_time * 0.5))
         else:
             self.model.grid.move_agent(self, next_pos)
 
-# --- 3. THE MODEL ---
-
-class GameMapModel(mesa.Model):
+# --- 3. THE SMART CITY BRAIN ---
+class SmartCityModel(mesa.Model):
     def __init__(self):
         super().__init__()
         self.grid = mesa.space.MultiGrid(GRID_SIZE, GRID_SIZE, torus=False)
         self.step_count = 0
-        
-        # Signal State
-        self.signal_state = "Horizontal_Green"
-        self.signal_timer = 0
-        
-        # Data storage
-        self.completed_cars = []
+        self.trip_times = []
+        self.avg_travel_time = 0
 
-        # --- BUILD THE MAP (Trees & Poles) ---
+        self.current_time_min = 8 * 60
+        self.congestion_level = "LOW"
+
+        self.phase_timer = 0
+        self.current_phase = "Vertical"
+        self.vertical_state = "Green"
+        self.horizontal_state = "Red"
+
+        self.signals = []
+        self.place_signals_all()
+        self.setup_map()
+
+    def setup_map(self):
         for x in range(GRID_SIZE):
             for y in range(GRID_SIZE):
-                
-                # If it's NOT a road...
-                if x != CENTER and y != CENTER:
-                    # 1. Place Signal Poles at Corners
-                    if (x == CENTER-1 and y == CENTER-1): 
-                        self.pole_h = SignalPole(self, "Horizontal")
-                        self.grid.place_agent(self.pole_h, (x,y))
-                    elif (x == CENTER+1 and y == CENTER+1):
-                        self.pole_v = SignalPole(self, "Vertical")
-                        self.grid.place_agent(self.pole_v, (x,y))
-                    
-                    # 2. Place Trees randomly
-                    elif random.random() < 0.3: 
-                        t = Tree(self)
-                        self.grid.place_agent(t, (x,y))
+                on_V = (x >= V1_LANE_1 and x <= V1_LANE_2) or (x >= V2_LANE_1 and x <= V2_LANE_2)
+                on_H = (y >= H_LANE_1 and y <= H_LANE_2) or (y >= F1_LANE_1 and y <= F1_LANE_2) or (y >= F2_LANE_1 and y <= F2_LANE_2)
+
+                if not (on_V or on_H) and self.grid.is_cell_empty((x,y)) and random.random() < 0.08:
+                    self.grid.place_agent(Tree(self), (x,y))
+
+                if (on_H and not on_V) and random.random() < 0.1:
+                    self.grid.place_agent(Pothole(self), (x,y))
+
+    def place_signals_all(self):
+        v_roads = [(V1_LANE_1, V1_LANE_2), (V2_LANE_1, V2_LANE_2)]
+        h_roads = [(H_LANE_1, H_LANE_2), (F1_LANE_1, F1_LANE_2), (F2_LANE_1, F2_LANE_2)]
+        for v in v_roads:
+            for h in h_roads:
+                self.place_signal_pole(v[0], v[1], h[0], h[1])
+
+    def place_signal_pole(self, v1, v2, h1, h2):
+        s_v1 = SignalPole(self, "Vertical"); self.grid.place_agent(s_v1, (v2+1, h1-1))
+        s_v2 = SignalPole(self, "Vertical"); self.grid.place_agent(s_v2, (v1-1, h2+1))
+        s_h1 = SignalPole(self, "Horizontal"); self.grid.place_agent(s_h1, (v1-1, h1-1))
+        s_h2 = SignalPole(self, "Horizontal"); self.grid.place_agent(s_h2, (v2+1, h2+1))
+        self.signals.extend([s_v1, s_v2, s_h1, s_h2])
 
     def step(self):
         self.step_count += 1
-        
-        # 1. Signal Logic (Switch every 6 ticks)
-        self.signal_timer += 1
-        if self.signal_timer > 6:
-            self.signal_timer = 0
-            if self.signal_state == "Horizontal_Green":
-                self.signal_state = "Vertical_Green"
-            else:
-                self.signal_state = "Horizontal_Green"
-        
-        # Update Pole Colors
-        self.pole_h.color = "🟢" if self.signal_state == "Horizontal_Green" else "🔴"
-        self.pole_v.color = "🟢" if self.signal_state == "Vertical_Green" else "🔴"
+        self.current_time_min += 1
 
-        # 2. Spawn Cars (Wave Logic)
-        if self.step_count == 1:
-            self.add_car("🏎️", "Red Racer", "Right", (0, CENTER))
-        if self.step_count == 3:
-            self.add_car("🚙", "Blue Van", "Up", (CENTER, 0))
-        if self.step_count == 8:
-            self.add_car("🚕", "Taxi", "Right", (0, CENTER))
-        if self.step_count == 12:
-            self.add_car("🚑", "Ambulance", "Up", (CENTER, 0))
+        # Rush Hour Logic
+        hour = (self.current_time_min // 60) % 24
+        spawn_rate = 0.4
+        self.congestion_level = "LOW"
+        if 8 <= hour < 10: spawn_rate = 0.95; self.congestion_level = "🚨 HIGH (RUSH HOUR)"
+        elif 17 <= hour < 19: spawn_rate = 0.90; self.congestion_level = "🚨 HIGH (EVENING)"
+        elif 10 <= hour < 16: spawn_rate = 0.6; self.congestion_level = "⚠️ MEDIUM"
 
-        # 3. Move Agents
+        # Signal Logic
+        v_wait = sum(1 for a in self.agents if isinstance(a, SmartVehicle) and a.wait_time > 0 and a.direction in ["Up", "Down"])
+        h_wait = sum(1 for a in self.agents if isinstance(a, SmartVehicle) and a.wait_time > 0 and a.direction in ["Left", "Right"])
+
+        self.phase_timer += 1
+        min_green_time = 5
+
+        if self.current_phase == "Vertical":
+            if h_wait > v_wait * 1.5 and self.phase_timer > min_green_time:
+                self.current_phase = "Horizontal"; self.phase_timer = 0
+            elif self.phase_timer > 20:
+                self.current_phase = "Horizontal"; self.phase_timer = 0
+        else:
+            if v_wait > h_wait * 1.5 and self.phase_timer > min_green_time:
+                self.current_phase = "Vertical"; self.phase_timer = 0
+            elif self.phase_timer > 20:
+                self.current_phase = "Vertical"; self.phase_timer = 0
+
+        if self.current_phase == "Vertical": self.vertical_state, self.horizontal_state = "Green", "Red"
+        else: self.vertical_state, self.horizontal_state = "Red", "Green"
+
+        for s in self.signals:
+            if s.group_id == "Vertical": s.state = self.vertical_state
+            else: s.state = self.horizontal_state
+
+        # SPAWNER (FIXED)
+        spawns = [
+            ("Right", (0, H_LANE_2)), ("Left", (GRID_SIZE-1, H_LANE_1)),
+            ("Up", (V1_LANE_2, 0)), ("Down", (V1_LANE_1, GRID_SIZE-1)),
+            ("Up", (V2_LANE_2, 0)), ("Down", (V2_LANE_1, GRID_SIZE-1)),
+            ("Right", (0, F1_LANE_2)), ("Left", (GRID_SIZE-1, F1_LANE_1)),
+            ("Right", (0, F2_LANE_2)), ("Left", (GRID_SIZE-1, F2_LANE_1))]
+
+        if random.random() < spawn_rate:
+            d, p = random.choice(spawns)
+
+            # --- THE FIX: IGNORE ROADS, CHECK FOR CARS ---
+            cell_contents = self.grid.get_cell_list_contents([p])
+            car_blocking = any(isinstance(o, SmartVehicle) for o in cell_contents)
+
+            if not car_blocking:
+                vt = random.choice(["Car", "Bus", "Bike", "Truck", "Auto"])
+                v = SmartVehicle(self, vt, d, p)
+                self.grid.place_agent(v, p)
+                self.agents.add(v)
+
         self.agents.shuffle_do("step")
-
-    def add_car(self, icon, name, direction, pos):
-        if self.grid.is_cell_empty(pos):
-            c = Car(self, icon, name, direction, pos)
-            self.grid.place_agent(c, pos)
-            self.agents.add(c)
-
-    def print_game_state(self):
-        # A. PRINT MAP
-        print(f"⏱️ TIME: {self.step_count} | SIGNAL MODE: {self.signal_state}\n")
-        
-        for y in range(GRID_SIZE-1, -1, -1):
-            row = ""
-            for x in range(GRID_SIZE):
-                cell = self.grid.get_cell_list_contents([(x,y)])
-                
-                # Base Terrain
-                if x == CENTER or y == CENTER:
-                    symbol = "⬛" # Road
-                    if x == CENTER and y == CENTER: symbol = "🔲" # Intersection
-                else:
-                    symbol = "🟩" # Grass
-                
-                # Overwrite with Agents
-                for obj in cell:
-                    if isinstance(obj, Tree): symbol = "🌲"
-                    if isinstance(obj, SignalPole): symbol = obj.color
-                    if isinstance(obj, Car): symbol = obj.icon
-                
-                row += symbol
-            print(row)
-
-        # B. PRINT SCOREBOARD
-        print("\n--- 🏁 LIVE VEHICLE TRACKER ---")
-        
-        # Gather data from Active cars + Finished cars
-        all_cars = []
-        
-        # Active Cars
-        for agent in self.agents:
-            if isinstance(agent, Car):
-                status = "Driving 💨" if agent.wait_time == 0 else "Waiting 🛑"
-                all_cars.append([agent.icon, agent.name, status, f"{agent.rating:.1f}/10"])
-        
-        # Finished Cars
-        for car in self.completed_cars:
-            all_cars.append([car.icon, car.name, "FINISHED ✅", f"{car.rating:.1f}/10"])
-
-        print(tabulate(all_cars, headers=["Car", "Name", "Status", "Rating"], tablefmt="simple_grid"))
+        if self.trip_times: self.avg_travel_time = sum(self.trip_times) / len(self.trip_times)
 
 # --- 4. RUNNER ---
-model = GameMapModel()
+fig, ax = plt.subplots(figsize=(10, 10))
+model = SmartCityModel()
 
-print("Starting Game Engine...")
+print("Starting Smart Traffic Network...")
 time.sleep(1)
 
-for i in range(40):
-    model.step()
-    clear_output(wait=True)
-    model.print_game_state()
-    time.sleep(0.4)
+try:
+    for i in range(300):
+        model.step()
+        ax.clear()
+        ax.set_facecolor('#2d5a27')
+
+        # Roads
+        for y in [H_LANE_1, V1_LANE_1, V2_LANE_1]:
+            ax.add_patch(patches.Rectangle((-0.5, H_LANE_1 - 0.5), GRID_SIZE, 2, color='#333333'))
+            ax.add_patch(patches.Rectangle((V1_LANE_1 - 0.5, -0.5), 2, GRID_SIZE, color='#333333'))
+            ax.add_patch(patches.Rectangle((V2_LANE_1 - 0.5, -0.5), 2, GRID_SIZE, color='#333333'))
+        ax.add_patch(patches.Rectangle((-0.5, F1_LANE_1 - 0.5), GRID_SIZE, 2, color='#555555'))
+        ax.add_patch(patches.Rectangle((-0.5, F2_LANE_1 - 0.5), GRID_SIZE, 2, color='#555555'))
+
+        # Draw Agents
+        x_b, y_b, c_b, s_b, m_b = [], [], [], [], []
+        x_a, y_a, m_a = [], [], []
+
+        for a in model.agents:
+            x, y = a.pos
+            if isinstance(a, SignalPole):
+                col = 'red' if a.state=='Red' else '#00ff00'
+                x_b.append(x); y_b.append(y); c_b.append(col); s_b.append(100); m_b.append('o')
+            elif isinstance(a, SmartVehicle):
+                x_b.append(x); y_b.append(y); c_b.append('cyan' if a.intent=='Straight' else 'orange'); s_b.append(120); m_b.append('s')
+                x_a.append(x); y_a.append(y); m_a.append(a.arrow)
+            elif isinstance(a, Tree): x_b.append(x); y_b.append(y); c_b.append('forestgreen'); s_b.append(60); m_b.append('^')
+            elif isinstance(a, Pothole): x_b.append(x); y_b.append(y); c_b.append('brown'); s_b.append(70); m_b.append('X')
+
+        for xp, yp, c, s, m in zip(x_b, y_b, c_b, s_b, m_b): ax.scatter(xp, yp, c=c, s=s, marker=m, edgecolors='black', linewidth=0.5, zorder=2)
+        for xp, yp, m in zip(x_a, y_a, m_a): ax.scatter(xp, yp, c='white', s=20, marker=m, zorder=3)
+
+        ax.set_xlim(-0.5, GRID_SIZE - 0.5); ax.set_ylim(-0.5, GRID_SIZE - 0.5)
+        ax.set_xticks([]); ax.set_yticks([])
+
+        h = (model.current_time_min // 60) % 24
+        m = model.current_time_min % 60
+        info = f"🕒 {h:02d}:{m:02d} | {model.congestion_level} | Avg Trip: {model.avg_travel_time:.1f}s"
+        ax.set_title(info, color='yellow', backgroundcolor='black', fontsize=12)
+
+        clear_output(wait=True)
+        display(fig)
+        time.sleep(0.1)
+
+except KeyboardInterrupt:
+    print("Stopped.")
